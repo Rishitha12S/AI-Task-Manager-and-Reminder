@@ -1,0 +1,264 @@
+import spacy
+import dateparser
+import pyttsx3
+import datetime
+import threading
+import time
+import tkinter as tk
+from tkinter import messagebox, simpledialog
+from plyer import notification
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+import joblib
+import re
+
+# === Initialize NLP and speech engine ===
+nlp = spacy.load("en_core_web_sm")
+engine = pyttsx3.init()
+
+# === Train Intent Classifier ===
+training_data = [
+    ("add a task to call mom tomorrow at 5 pm", "add_task"),
+    ("remind me to buy groceries", "add_task"),
+    ("set a reminder to attend meeting on Monday", "add_task"),
+    ("delete the task call mom", "delete_task"),
+    ("remove the grocery reminder", "delete_task"),
+    ("show all my tasks", "list_tasks"),
+    ("list my reminders", "list_tasks"),
+    ("complete the meeting task", "complete_task"),
+    ("mark the grocery task as done", "complete_task"),
+    ("quit the application", "exit"),
+    ("stop the assistant", "exit"),
+]
+
+X_train = [x[0] for x in training_data]
+y_train = [x[1] for x in training_data]
+model = Pipeline([
+    ('tfidf', TfidfVectorizer()),
+    ('clf', LogisticRegression())
+])
+model.fit(X_train, y_train)
+joblib.dump(model, 'intent_classifier.pkl')
+
+tasks = []
+completed_tasks = []
+
+# === Speak Function ===
+def speak(text):
+    print("Assistant:", text)
+    engine.say(text)
+    engine.runAndWait()
+
+# === Notification Function ===
+def show_notification(title, message):
+    notification.notify(title=title, message=message, timeout=10)
+
+# === Enhanced DateTime Extractor ===
+def extract_datetime(text):
+    dt = dateparser.parse(text, settings={'PREFER_DATES_FROM': 'future'})
+    print("[DEBUG] Command passed to extract_datetime:", text)
+    print("[DEBUG] Parsed datetime:", dt)
+
+    if dt is None:
+        time_match = re.search(r'(\d{1,2}:\d{2}\s*(am|pm)?)', text, re.IGNORECASE)
+        if time_match:
+            time_str = time_match.group(1)
+            try:
+                now = datetime.datetime.now()
+                dt = datetime.datetime.strptime(time_str, "%I:%M %p")
+                dt = dt.replace(year=now.year, month=now.month, day=now.day)
+                if dt < now:
+                    dt += datetime.timedelta(days=1)
+                print("[DEBUG] Fallback datetime parsed:", dt)
+            except Exception as e:
+                print("[DEBUG] Time-only parse failed:", e)
+                dt = None
+    return dt
+
+# === Intent and Entity Extraction ===
+def get_intent_and_entities(text):
+    intent = model.predict([text])[0]
+    stop_words = {'add', 'create', 'set', 'delete', 'remove', 'show', 'list', 'display',
+                  'complete', 'done', 'finish', 'mark',
+                  'exit', 'quit', 'stop', 'bye', 'task', 'reminder', 'to', 'the', 'my', 'in', 'on', 'at', 'for'}
+    words = text.lower().split()
+    entities = [w for w in words if w not in stop_words]
+    task_desc = " ".join(entities).strip()
+    return intent, task_desc
+
+# === Add Task ===
+def add_task(command):
+    remind_time = extract_datetime(command)
+    task_desc = command.lower()
+    recurring = None
+    if 'daily' in task_desc:
+        recurring = 'daily'
+    elif 'weekly' in task_desc:
+        recurring = 'weekly'
+    elif 'monthly' in task_desc:
+        recurring = 'monthly'
+
+    for phrase in [' at ', ' on ', ' tomorrow', ' next ', ' am', ' pm', ' today', 'daily', 'weekly', 'monthly', 'in']:
+        task_desc = task_desc.replace(phrase, ' ')
+    for word in ['add', 'reminder', 'set', 'to', 'task', 'remind', 'me']:
+        task_desc = task_desc.replace(word, '')
+    task_desc = task_desc.strip()
+    if not task_desc:
+        speak("Please provide a task description.")
+        return
+
+    if remind_time is None:
+        speak("Could not parse the date/time. Task will be added without reminder.")
+
+    priority = simpledialog.askstring("Task Priority", "Enter task priority (High, Medium, Low):")
+    if priority:
+        priority = priority.capitalize()
+        if priority not in ['High', 'Medium', 'Low']:
+            speak("Invalid priority entered. Setting to Medium.")
+            priority = "Medium"
+    else:
+        priority = "Medium"
+
+    category = simpledialog.askstring("Task Category", "Enter task category (Work, Personal, Shopping, etc.):")
+    if category:
+        category = category.capitalize()
+    else:
+        category = "General"
+
+    tasks.append({
+        'task': task_desc,
+        'time': remind_time,
+        'priority': priority,
+        'category': category,
+        'recurring': recurring
+    })
+    speak(f"Task added: {task_desc} with priority {priority} in category {category}" +
+          (f" at {remind_time.strftime('%Y-%m-%d %H:%M')}" if remind_time else "") +
+          (f" (recurs {recurring})" if recurring else ""))
+    refresh_task_listbox()
+
+# === Task Listing, Deletion, Completion ===
+def list_tasks():
+    if not tasks and not completed_tasks:
+        return "You have no tasks."
+    result = "Pending Tasks:\n"
+    for i, t in enumerate(tasks, 1):
+        desc = t['task']
+        if t['time']:
+            desc += f" at {t['time'].strftime('%Y-%m-%d %I:%M %p')}"
+        desc += f" | Priority: {t['priority']} | Category: {t['category']}"
+        if t.get('recurring'):
+            desc += f" | Recurs: {t['recurring']}"
+        result += f"{i}. {desc}\n"
+    result += "\nCompleted Tasks:\n"
+    for i, t in enumerate(completed_tasks, 1):
+        desc = t['task']
+        desc += f" | Priority: {t['priority']} | Category: {t['category']}"
+        desc += f" | Completed at: {t['completed_time'].strftime('%Y-%m-%d %I:%M %p')}"
+        result += f"{i}. {desc}\n"
+    return result
+
+def delete_task(task_desc):
+    for t in tasks:
+        if task_desc in t['task'].lower():
+            tasks.remove(t)
+            speak(f"Deleted task: {t['task']}")
+            refresh_task_listbox()
+            return
+    speak("Task not found.")
+
+def complete_task(task_desc):
+    for t in tasks:
+        if task_desc in t['task'].lower():
+            tasks.remove(t)
+            t['completed_time'] = datetime.datetime.now()
+            completed_tasks.append(t)
+            speak(f"Completed task: {t['task']}")
+            refresh_task_listbox()
+            return
+    speak("Task not found to complete.")
+
+# === Tkinter-Safe Reminder Loop ===
+def reminder_loop_tk():
+    now = datetime.datetime.now()
+    print("[DEBUG] Running reminder loop at", now)
+    for t in tasks[:]:
+        if t['time'] and now >= t['time']:
+            speak(f"Reminder: {t['task']}")
+            show_notification("Task Reminder", t['task'])
+            if t.get('recurring'):
+                if t['recurring'] == 'daily':
+                    t['time'] += datetime.timedelta(days=1)
+                elif t['recurring'] == 'weekly':
+                    t['time'] += datetime.timedelta(weeks=1)
+                elif t['recurring'] == 'monthly':
+                    t['time'] += datetime.timedelta(days=30)
+            else:
+                tasks.remove(t)
+            refresh_task_listbox()
+    root.after(30000, reminder_loop_tk)
+
+# === Command Processing ===
+def process_command(command):
+    intent, task_desc = get_intent_and_entities(command)
+    print(f"[DEBUG] Intent: {intent}, Task desc: {task_desc}")
+    if intent == "add_task":
+        add_task(command)
+    elif intent == "list_tasks":
+        messagebox.showinfo("Tasks", list_tasks())
+    elif intent == "delete_task":
+        if task_desc:
+            delete_task(task_desc)
+        else:
+            speak("Please specify which task to delete.")
+    elif intent == "complete_task":
+        if task_desc:
+            complete_task(task_desc)
+        else:
+            speak("Please specify which task to complete.")
+    elif intent == "exit":
+        speak("Goodbye! Have a nice day.")
+        root.quit()
+    else:
+        speak("Sorry, I did not understand that command.")
+
+# === GUI Setup ===
+root = tk.Tk()
+root.title("AI Task Manager Assistant")
+
+frame = tk.Frame(root)
+frame.pack(padx=10, pady=10)
+
+task_listbox = tk.Listbox(frame, width=70, height=10)
+task_listbox.pack()
+
+button_frame = tk.Frame(frame)
+button_frame.pack(pady=5)
+
+tk.Button(button_frame, text="Add Task", command=lambda: process_command("add " + simpledialog.askstring("Add Task", "Enter task and optional time:"))).grid(row=0, column=0, padx=5)
+tk.Button(button_frame, text="Delete Selected Task", command=lambda: process_command("delete " + tasks[task_listbox.curselection()[0]]['task'] if task_listbox.curselection() else speak("Select a task."))).grid(row=0, column=1, padx=5)
+tk.Button(button_frame, text="Complete Selected Task", command=lambda: process_command("complete " + tasks[task_listbox.curselection()[0]]['task'] if task_listbox.curselection() else speak("Select a task."))).grid(row=0, column=2, padx=5)
+tk.Button(button_frame, text="Show All Tasks", command=lambda: messagebox.showinfo("Tasks", list_tasks())).grid(row=0, column=3, padx=5)
+tk.Button(button_frame, text="Exit", command=root.quit).grid(row=0, column=4, padx=5)
+
+tk.Label(frame, text="Or enter command:").pack(pady=(10, 0))
+command_entry = tk.Entry(frame, width=70)
+command_entry.pack()
+command_entry.bind("<Return>", lambda event: (process_command(command_entry.get()), command_entry.delete(0, tk.END)))
+
+def refresh_task_listbox():
+    task_listbox.delete(0, tk.END)
+    for t in tasks:
+        desc = t['task']
+        if t['time']:
+            desc += f" at {t['time'].strftime('%Y-%m-%d %I:%M %p')}"
+        desc += f" | Priority: {t['priority']} | Category: {t['category']}"
+        if t.get('recurring'):
+            desc += f" | Recurs: {t['recurring']}"
+        task_listbox.insert(tk.END, desc)
+
+# === Start Assistant ===
+speak("Hello! Task Manager Assistant is running.")
+reminder_loop_tk()
+root.mainloop()
